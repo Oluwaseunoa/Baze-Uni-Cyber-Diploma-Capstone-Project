@@ -1,0 +1,578 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Enhanced WordPress Site with VPC, ALB (HTTP->HTTPS optional), ASG, RDS, EFS, IAM, and AutoScaling policies + alarms
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+
+  DBName:
+    Type: String
+    Default: wordpress
+    Description: WordPress database name
+
+  DBUsername:
+    Type: String
+    Default: admin
+    Description: WordPress database username
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: WordPress database password
+
+  MinCapacity:
+    Type: Number
+    Default: 2
+    Description: Minimum number of instances
+
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    Description: Maximum number of instances
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired number of instances
+
+  LatestAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+    Description: Use SSM parameter to resolve the latest Amazon Linux 2 AMI in the region
+
+  ACMCertificateArn:
+    Type: String
+    Default: ""
+    Description: (Optional) ARN of an existing ACM certificate in this region. If provided, an HTTPS listener and HTTP->HTTPS redirect will be created.
+
+Conditions:
+  UseACM: !Not [ !Equals [ !Ref ACMCertificateArn, "" ] ]
+
+Resources:
+  ###############################
+  # VPC & Networking
+  ###############################
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: wordpress-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: wordpress-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets
+  PublicSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: wordpress-public-az1
+
+  PublicSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: wordpress-public-az2
+
+  # Private Subnets
+  PrivateAppSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.3.0/24
+      Tags:
+        - Key: Name
+          Value: wordpress-private-app-az1
+
+  PrivateAppSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.4.0/24
+      Tags:
+        - Key: Name
+          Value: wordpress-private-app-az2
+
+  # NAT Gateway in Public Subnet
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: wordpress-nat-eip
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnetAZ1
+      Tags:
+        - Key: Name
+          Value: wordpress-nat-gateway
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: wordpress-public-rt
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: wordpress-private-rt
+
+  # Routes
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  # Route Table Associations
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAZ1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAZ2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetAZ1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetAZ2
+      RouteTableId: !Ref PrivateRouteTable
+
+  ###############################
+  # Security Groups
+  ###############################
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and HTTPS traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP, HTTPS, and SSH traffic from ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+
+  ###############################
+  # IAM Role for EC2
+  ###############################
+
+  WordPressEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: wordpress-ec2-role
+
+  WordPressEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WordPressEC2Role
+
+  ###############################
+  # RDS MySQL Database
+  ###############################
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for WordPress RDS
+      SubnetIds:
+        - !Ref PrivateAppSubnetAZ1
+        - !Ref PrivateAppSubnetAZ2
+
+  WordPressDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Ref DBName
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: "8.0"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !GetAtt DatabaseSecurityGroup.GroupId
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+      StorageType: gp2
+      Tags:
+        - Key: Name
+          Value: wordpress-db
+
+  ###############################
+  # EFS FileSystem
+  ###############################
+
+  WordPressEFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      FileSystemTags:
+        - Key: Name
+          Value: wordpress-efs
+
+  MountTargetAZ1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressEFS
+      SubnetId: !Ref PrivateAppSubnetAZ1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  MountTargetAZ2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressEFS
+      SubnetId: !Ref PrivateAppSubnetAZ2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  ###############################
+  # Application Load Balancer
+  ###############################
+
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: wordpress-alb
+      Subnets:
+        - !Ref PublicSubnetAZ1
+        - !Ref PublicSubnetAZ2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: !If
+        - UseACM
+        -
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+        -
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HTTPSListener:
+    Condition: UseACM
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref ACMCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  ###############################
+  # Launch Template & Auto Scaling
+  ###############################
+
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: wordpress-launch-template
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t3.micro
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref WordPressEC2InstanceProfile
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+            exec > >(tee /var/log/user-data.log) 2>&1
+
+            # Update system
+            yum update -y
+
+            # Install Apache
+            yum install -y httpd httpd-tools mod_ssl
+            systemctl enable httpd
+            systemctl start httpd
+
+            # Install PHP 7.4
+            amazon-linux-extras enable php7.4
+            yum clean metadata
+            yum install -y php php-common php-pear
+            yum install -y php-{cgi,curl,mbstring,gd,mysqlnd,gettext,json,xml,fpm,intl,zip,mysqli}
+
+            # Install MySQL client
+            yum install -y mysql
+
+            # Create HTML directory and mount EFS
+            mkdir -p /var/www/html
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport ${WordPressEFS}.efs.${AWS::Region}.amazonaws.com:/ /var/www/html || true
+
+            # Add to fstab for persistence
+            echo "${WordPressEFS}.efs.${AWS::Region}.amazonaws.com:/ /var/www/html nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport 0 0" >> /etc/fstab || true
+
+            # Set permissions
+            usermod -a -G apache ec2-user
+            chown -R ec2-user:apache /var/www
+            chmod 2775 /var/www
+            find /var/www -type d -exec chmod 2775 {} \;
+            find /var/www -type f -exec chmod 0664 {} \;
+            chown apache:apache -R /var/www/html
+
+            # Download and install WordPress only if not already installed
+            cd /var/www/html
+            if [ ! -f wp-config.php ]; then
+              wget https://wordpress.org/latest.tar.gz
+              tar -xzf latest.tar.gz
+              cp -r wordpress/* /var/www/html/
+              rm -rf wordpress latest.tar.gz
+
+              # Create wp-config.php
+              cp wp-config-sample.php wp-config.php
+
+              # Configure database connection
+              sed -i "s/database_name_here/${DBName}/g" wp-config.php
+              sed -i "s/username_here/${DBUsername}/g" wp-config.php
+              sed -i "s/password_here/${DBPassword}/g" wp-config.php
+              sed -i "s/localhost/${WordPressDB.Endpoint.Address}/g" wp-config.php
+
+              # Add SSL settings for ALB
+              cat >> wp-config.php << 'EOF'
+
+            /* SSL Settings */
+            define('FORCE_SSL_ADMIN', true);
+            if(isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+              $_SERVER['HTTPS'] = '1';
+            }
+            EOF
+            fi
+
+            # Final permissions and restart
+            chown apache:apache -R /var/www/html
+            systemctl restart httpd
+
+            echo "WordPress installation completed successfully"
+
+  WordPressAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: wordpress-asg
+      VPCZoneIdentifier:
+        - !Ref PrivateAppSubnetAZ1
+        - !Ref PrivateAppSubnetAZ2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordPressLaunchTemplate
+        Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: wordpress-web-server
+          PropagateAtLaunch: true
+
+  # Keep a TargetTracking scaling policy (CPU-based)
+  ScaleCpuTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WordPressAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 55.0
+
+  # Additional CloudWatch alarms + StepScaling policies for more deterministic scaling
+  CPUHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WordPress-CPU-High
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WordPressAutoScalingGroup
+      AlarmActions: []
+
+  CPULowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WordPress-CPU-Low
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 20
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WordPressAutoScalingGroup
+      AlarmActions: []
+
+Outputs:
+  LoadBalancerDNS:
+    Description: Application Load Balancer DNS Name
+    Value: !GetAtt AppLoadBalancer.DNSName
+
+  DatabaseEndpoint:
+    Description: RDS MySQL Endpoint
+    Value: !GetAtt WordPressDB.Endpoint.Address
+
+  EFSFileSystemId:
+    Description: EFS File System ID
+    Value: !Ref WordPressEFS
+
+  WebsiteURL:
+    Description: WordPress Website URL
+    Value: !Sub http://${AppLoadBalancer.DNSName}
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
