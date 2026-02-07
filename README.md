@@ -1,10 +1,10 @@
 
 # Capstone Project Submission
 
-**Title:** Effect of Orchestration and Microsegmentation on Web Application Security  
-**Student Name:** Oluwaseun Osunsola  
-**Student ID:** IDEAS/24/63183  
-**Program:** Professional Diploma in Cybersecurity – Baze University  
+**Title:** Effect of Orchestration and Microsegmentation on Web Application Security   
+**Student Name:** Oluwaseun Osunsola   
+**Student ID:** IDEAS/24/63183   
+**Program:** Professional Diploma in Cybersecurity – Baze University   
 
 
 ---
